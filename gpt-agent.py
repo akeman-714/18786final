@@ -9,20 +9,23 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from typing import Dict, List, Any, Optional
 
-# Load environment variables from .env file
+# 从.env文件加载环境变量
 load_dotenv()
 
-# Set API keys from environment variables
+# 获取API密钥
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 SKYSCANNER_API_KEY = os.environ.get("SKYSCANNER_API_KEY")
 
-# Initialize OpenAI client
+# 初始化OpenAI客户端
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-def llm(query, history=[], user_stop_words=[]):
-    """LLM function - Use OpenAI API"""
-    messages = [{"role": "system", "content": "You are a helpful assistant specialized in flight booking assistance. Help users find the best flights based on their needs."}]
+def llm(query, system_prompt=None, history=[], user_stop_words=[], temperature=0.7):
+    """使用OpenAI API的LLM函数"""
+    if system_prompt is None:
+        system_prompt = "You are a helpful assistant specialized in flight booking assistance. Help users find the best flights based on their needs."
+    
+    messages = [{"role": "system", "content": system_prompt}]
     for hist in history:
         messages.append({"role": "user", "content": hist[0]})
         messages.append({"role": "assistant", "content": hist[1]})
@@ -32,21 +35,132 @@ def llm(query, history=[], user_stop_words=[]):
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=messages,
+            temperature=temperature,
             stop=user_stop_words
         )
         return response.choices[0].message.content
     except Exception as e:
         return str(e)
 
-# Set up Tavily search tool
+# 设置Tavily搜索工具
 os.environ['TAVILY_API_KEY'] = TAVILY_API_KEY
-tavily = TavilySearchResults(max_results=5)
+tavily = TavilySearchResults(max_results=3)
 tavily.description = 'This is a search engine for general information. Use it to search for travel guides, visa requirements, travel restrictions, and other travel-related information.'
 
+class SkyscannerAPIClient:
+    """Skyscanner API接口封装"""
+    
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.headers = {
+            "x-rapidapi-key": self.api_key,
+            "x-rapidapi-host": "skyscanner89.p.rapidapi.com"
+        }
+        # 位置ID缓存
+        self.location_cache = {}
+        
+    def auto_complete(self, query, locale="en-US", market="US", currency="USD"):
+        """获取Skyscanner位置建议"""
+        cache_key = f"{query}_{locale}_{market}_{currency}"
+        
+        if cache_key in self.location_cache:
+            return self.location_cache[cache_key]
+            
+        url = "https://skyscanner89.p.rapidapi.com/flights/auto-complete"
+        querystring = {
+            "query": query,
+            "locale": locale,
+            "market": market,
+            "currency": currency
+        }
+        
+        try:
+            response = requests.get(url, headers=self.headers, params=querystring)
+            if response.status_code == 200:
+                data = response.json()
+                self.location_cache[cache_key] = data
+                return data
+            else:
+                return {"error": f"API error: {response.status_code}", "message": response.text}
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def get_location_details(self, query):
+        """从自动完成结果中提取位置详情"""
+        data = self.auto_complete(query)
+        
+        if "error" in data:
+            return None
+            
+        results = data.get("inputSuggest", [])
+        if not results:
+            return None
+            
+        # 先找精确匹配(精确的城市/机场代码)
+        for result in results:
+            flight_params = result.get("navigation", {}).get("relevantFlightParams", {})
+            sky_id = flight_params.get("skyId", "")
+            if sky_id and sky_id.upper() == query.upper():
+                return {
+                    "entityId": flight_params.get("entityId"),
+                    "skyId": sky_id,
+                    "name": flight_params.get("localizedName"),
+                    "type": flight_params.get("flightPlaceType")
+                }
+        
+        # 没有精确匹配，取第一个结果
+        if results:
+            flight_params = results[0].get("navigation", {}).get("relevantFlightParams", {})
+            return {
+                "entityId": flight_params.get("entityId"),
+                "skyId": flight_params.get("skyId"),
+                "name": flight_params.get("localizedName"),
+                "type": flight_params.get("flightPlaceType")
+            }
+            
+        return None
+    
+    def search_one_way_flights(self, date, origin, origin_id, destination, destination_id, 
+                              cabin_class="economy", adults=1, children=0, infants=0):
+        """搜索单程航班"""
+        url = "https://skyscanner89.p.rapidapi.com/flights/one-way/list"
+        
+        # 验证舱位等级
+        valid_classes = ["economy", "premium_economy", "business"]
+        if cabin_class.lower() not in valid_classes:
+            cabin_class = "economy"
+        
+        # 准备查询参数
+        querystring = {
+            "date": date,
+            "origin": origin,
+            "originId": origin_id,
+            "destination": destination,
+            "destinationId": destination_id,
+            "cabinClass": cabin_class.lower(),
+            "adults": str(adults),
+        }
+        
+        # 添加可选参数
+        if children > 0:
+            querystring["children"] = str(children)
+        if infants > 0:
+            querystring["infants"] = str(infants)
+            
+        try:
+            response = requests.get(url, headers=self.headers, params=querystring)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {"status": "error", "message": f"API error: {response.status_code}", "details": response.text}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
 class SkyscannerFlightSearchTool:
-    """Skyscanner Flight Search Tool"""
+    """Skyscanner航班搜索工具"""
     name = "flight_search"
-    description = "Search for flights between an origin and destination on a specific date using Skyscanner API. This tool can search for one-way or round-trip flights with specified cabin class and number of passengers."
+    description = "Search for flights between an origin and destination on a specific date using Skyscanner API. This tool can search for one-way flights with specified cabin class and number of passengers."
     args = {
         "origin": {
             "type": "string",
@@ -60,79 +174,45 @@ class SkyscannerFlightSearchTool:
             "type": "string",
             "description": "Departure date in YYYY-MM-DD format"
         },
-        "return_date": {
-            "type": "string",
-            "description": "Return date in YYYY-MM-DD format for round trips (optional)"
-        },
         "adults": {
             "type": "integer",
             "description": "Number of adult passengers (default: 1)"
         },
         "cabin_class": {
             "type": "string",
-            "description": "Cabin class (Economy, Premium Economy, Business, First) (default: Economy)"
+            "description": "Cabin class (Economy, Premium Economy, Business) (default: Economy)"
+        },
+        "children": {
+            "type": "integer",
+            "description": "Number of children (2-12 years) (default: 0)"
+        },
+        "infants": {
+            "type": "integer",
+            "description": "Number of infants (under 2 years) (default: 0)"
         }
     }
 
     def __init__(self):
-        # Set Skyscanner API key from environment variable
-        self.api_key = SKYSCANNER_API_KEY
-        self.headers = {
-            "x-rapidapi-key": self.api_key,
-            "x-rapidapi-host": "skyscanner89.p.rapidapi.com"
-        }
-        # Cache for location IDs to avoid repeated API calls
-        self.location_id_cache = {}
+        self.api_client = SkyscannerAPIClient(SKYSCANNER_API_KEY)
 
     def invoke(self, input):
-        """Call flight search tool"""
+        """调用航班搜索工具"""
         try:
-            # Try to parse input
-            try:
-                input_data = json.loads(input)
-            except json.JSONDecodeError:
-                # If JSON parsing fails, try parsing key=value pairs
-                input_data = {}
-                # Remove braces (if present)
-                input = input.strip()
-                if input.startswith('{') and input.endswith('}'):
-                    input = input[1:-1]
-                
-                # Parse key=value pairs
-                pairs = re.split(r',\s*', input)
-                for pair in pairs:
-                    if '=' in pair:
-                        key, value = pair.split('=', 1)
-                        key = key.strip()
-                        value = value.strip()
-                        
-                        # Convert to appropriate types
-                        if key == 'adults':
-                            try:
-                                value = int(value)
-                            except ValueError:
-                                value = 1
-                        elif key in ['origin', 'destination', 'date', 'return_date', 'cabin_class']:
-                            # Remove quotes (if present)
-                            if value.startswith('"') and value.endswith('"'):
-                                value = value[1:-1]
-                            elif value.startswith("'") and value.endswith("'"):
-                                value = value[1:-1]
-                        
-                        input_data[key] = value
+            input_data = self._parse_input(input)
             
             origin = input_data.get("origin", "")
             destination = input_data.get("destination", "")
             date = input_data.get("date", "")
-            return_date = input_data.get("return_date", None)
             adults = input_data.get("adults", 1)
             cabin_class = input_data.get("cabin_class", "Economy")
+            children = input_data.get("children", 0)
+            infants = input_data.get("infants", 0)
             
-            # Validate required fields
+            # 验证必填字段
             if not origin or not destination or not date:
                 return "Error: Required fields missing. Please provide origin, destination, and date."
             
-            # Validate date format and ensure it's in the future
+            # 验证日期格式
             try:
                 date_obj = datetime.datetime.strptime(date, "%Y-%m-%d").date()
                 today = datetime.datetime.now().date()
@@ -140,165 +220,107 @@ class SkyscannerFlightSearchTool:
                     return f"Error: The requested departure date {date} is in the past. Please choose a future date."
             except ValueError:
                 return f"Error: Invalid date format '{date}'. Please use YYYY-MM-DD format."
-                
-            # Validate return date if provided
-            if return_date:
-                try:
-                    return_date_obj = datetime.datetime.strptime(return_date, "%Y-%m-%d").date()
-                    if return_date_obj < today:
-                        return f"Error: The requested return date {return_date} is in the past. Please choose a future date."
-                    if return_date_obj < date_obj:
-                        return f"Error: The return date {return_date} cannot be before the departure date {date}."
-                except ValueError:
-                    return f"Error: Invalid return date format '{return_date}'. Please use YYYY-MM-DD format."
             
-            # Use Skyscanner API to search for flights
-            return self._search_skyscanner(origin, destination, date, return_date, adults, cabin_class)
+            # 获取位置详情
+            origin_details = self.api_client.get_location_details(origin)
+            if not origin_details:
+                return f"Error: Could not find location information for origin '{origin}'."
             
-        except Exception as e:
-            return f"Error performing flight search: {str(e)}"
-    
-    def _search_skyscanner(self, origin, destination, date, return_date=None, adults=1, cabin_class="Economy"):
-        """Use Skyscanner API to search for flights"""
-        try:
-            # Convert cabin class to Skyscanner format
+            destination_details = self.api_client.get_location_details(destination)
+            if not destination_details:
+                return f"Error: Could not find location information for destination '{destination}'."
+            
+            # 映射舱位等级
             cabin_map = {
                 "Economy": "economy",
                 "Premium Economy": "premium_economy",
                 "Business": "business",
-                "First": "business"  # API does not have First class option, using business instead
+                "First": "business"  # API使用business表示头等舱
             }
             skyscanner_cabin = cabin_map.get(cabin_class, "economy")
             
-            # Get location IDs for origin and destination
-            origin_id = self._get_location_id(origin)
-            destination_id = self._get_location_id(destination)
+            # 执行航班搜索
+            results = self.api_client.search_one_way_flights(
+                date=date,
+                origin=origin_details.get("skyId", origin),
+                origin_id=origin_details.get("entityId", ""),
+                destination=destination_details.get("skyId", destination),
+                destination_id=destination_details.get("entityId", ""),
+                cabin_class=skyscanner_cabin,
+                adults=adults,
+                children=children,
+                infants=infants
+            )
             
-            # Use exact format from API documentation
-            url = "https://skyscanner89.p.rapidapi.com/flights/one-way/list"
+            if results.get("status") == "error":
+                return f"Error performing flight search: {results.get('message', 'Unknown error')}"
             
-            # Format query parameters according to new format
-            querystring = {
-                "date": date,
-                "origin": origin,
-                "originId": origin_id,
-                "destination": destination,
-                "destinationId": destination_id,
-                "cabinClass": skyscanner_cabin,
-                "adults": str(adults),
-                "children": "-7"  # This is required by the API
-            }
+            return self._format_flight_results(results, origin, destination, date, adults, cabin_class)
             
-            # Make API request
-            print(f"Making API request with parameters: {querystring}")
-            response = requests.get(url, headers=self.headers, params=querystring)
-            
-            # Check if request was successful
-            if response.status_code == 200:
-                data = response.json()
-                
-                if data.get("status") != "success":
-                    error_msg = data.get("errors") or "Unknown API error"
-                    return f"Skyscanner API returned errors: {error_msg}"
-                
-                return self._format_skyscanner_response(data, origin, destination, date, return_date, adults, cabin_class)
-            else:
-                error_text = response.text
-                return f"Skyscanner API error: Status code {response.status_code}, Response: {error_text}"
-                
         except Exception as e:
-            return f"Skyscanner API call failed: {str(e)}"
+            return f"Error performing flight search: {str(e)}"
     
-    def _get_location_id(self, location_code):
-        """Get location ID for airport code"""
-        # Check cache first
-        if location_code in self.location_id_cache:
-            return self.location_id_cache[location_code]
-            
-        # Default location IDs for common airports
-        default_ids = {
-            "NYCA": "27537542",  # New York City area
-            "JFK": "27545983",   # JFK Airport
-            "LGA": "27544957",   # LaGuardia
-            "EWR": "27545306",   # Newark
-            "HNL": "95673827",   # Honolulu
-            "LAX": "27538634",   # Los Angeles
-            "SFO": "27537542",   # San Francisco
-            "ORD": "95673827",   # Chicago
-            "LHR": "29475375",   # London
-            "CDG": "27539733"    # Paris
-        }
+    def _parse_input(self, input):
+        """解析工具输入"""
+        input_data = {}
         
-        # If the location code is directly in our defaults, use that
-        if location_code in default_ids:
-            entity_id = default_ids[location_code]
-            self.location_id_cache[location_code] = entity_id
-            print(f"Using entity ID for {location_code}: {entity_id}")
-            return entity_id
-            
         try:
-            # Call the auto-complete API to get the correct location ID
-            url = "https://skyscanner89.p.rapidapi.com/flights/auto-complete"
-            querystring = {"query": location_code}
+            input_data = json.loads(input)
+        except json.JSONDecodeError:
+            input = input.strip()
+            if input.startswith('{') and input.endswith('}'):
+                input = input[1:-1]
             
-            print(f"Looking up location ID for {location_code}")
-            response = requests.get(url, headers=self.headers, params=querystring)
-            
-            if response.status_code == 200:
-                data = response.json()
-                # Search for exact match first
-                for item in data.get("data", []):
-                    if item.get("iata") == location_code:
-                        entity_id = item.get("entityId")
-                        # Cache the result
-                        self.location_id_cache[location_code] = entity_id
-                        return entity_id
-                
-                # If no exact match, use the first result
-                if data.get("data") and len(data["data"]) > 0:
-                    entity_id = data["data"][0].get("entityId")
-                    # Cache the result
-                    self.location_id_cache[location_code] = entity_id
-                    return entity_id
-            
-            # Fallback to default mapping
-            entity_id = default_ids.get(location_code, "27537542")  # Default to NYC if not found
-            self.location_id_cache[location_code] = entity_id
-            return entity_id
-            
-        except Exception as e:
-            print(f"Error getting location ID: {str(e)}")
-            # Fallback to default mapping
-            entity_id = default_ids.get(location_code, "27537542")
-            return entity_id
-    
-    def _format_skyscanner_response(self, data, origin, destination, date, return_date, adults, cabin_class):
-        """Format Skyscanner API response into a consistent format"""
-        try:
-            # Extract flight data from the new structure
-            flight_data = data.get("data", {}).get("itineraries", {})
-            
-            # Get items from the "Best" bucket (most relevant flights)
-            best_bucket = None
-            for bucket in flight_data.get("buckets", []):
-                if bucket.get("id") == "Best":
-                    best_bucket = bucket
-                    break
+            pairs = re.split(r',\s*', input)
+            for pair in pairs:
+                if '=' in pair:
+                    key, value = pair.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
                     
-            if not best_bucket:
-                # If no "Best" bucket, try "Cheapest"
-                for bucket in flight_data.get("buckets", []):
-                    if bucket.get("id") == "Cheapest":
-                        best_bucket = bucket
-                        break
+                    # 移除引号
+                    if value.startswith('"') and value.endswith('"'):
+                        value = value[1:-1]
+                    elif value.startswith("'") and value.endswith("'"):
+                        value = value[1:-1]
+                    
+                    # 转换类型
+                    if key in ['adults', 'children', 'infants']:
+                        try:
+                            value = int(value)
+                        except ValueError:
+                            if key == 'adults':
+                                value = 1
+                            else:
+                                value = 0
+                    
+                    input_data[key] = value
+        
+        return input_data
+    
+    def _format_flight_results(self, results, origin, destination, date, adults, cabin_class):
+        """格式化航班搜索结果"""
+        try:
+            flight_data = results.get("data", {}).get("itineraries", {})
             
-            if not best_bucket or not best_bucket.get("items"):
+            # 获取最佳或最便宜航班项目
+            target_buckets = ["Best", "Cheapest"] 
+            selected_bucket = None
+            
+            for bucket_id in target_buckets:
+                for bucket in flight_data.get("buckets", []):
+                    if bucket.get("id") == bucket_id and bucket.get("items"):
+                        selected_bucket = bucket
+                        break
+                if selected_bucket:
+                    break
+            
+            if not selected_bucket or not selected_bucket.get("items"):
                 return "No flights found for your search criteria."
             
-            # Format outbound flights
-            outbound_flights = []
-            for item in best_bucket.get("items", []):
-                # Get the leg information
+            # 格式化结果
+            flights = []
+            for item in selected_bucket.get("items", [])[:5]:  # 限制为前5个结果
                 if not item.get("legs"):
                     continue
                 
@@ -307,12 +329,11 @@ class SkyscannerFlightSearchTool:
                 if not segments:
                     continue
                 
-                # Get carrier information
+                # 获取航空公司信息
                 carrier_info = None
                 if "carriers" in leg and "marketing" in leg["carriers"] and leg["carriers"]["marketing"]:
                     carrier_info = leg["carriers"]["marketing"][0]
                 
-                # Format the flight
                 flight = {
                     "airline": carrier_info.get("name", "Unknown Airline") if carrier_info else "Unknown Airline",
                     "flight_number": segments[0].get("flightNumber", "") if segments else "",
@@ -325,17 +346,16 @@ class SkyscannerFlightSearchTool:
                     "cabin_class": cabin_class,
                     "price": item.get("price", {}).get("raw", 0),
                     "formatted_price": item.get("price", {}).get("formatted", "$0"),
-                    "currency": "USD",
                     "stops": leg.get("stopCount", 0)
                 }
                 
-                outbound_flights.append(flight)
+                flights.append(flight)
             
-            # Sort by price
-            outbound_flights = sorted(outbound_flights, key=lambda x: x["price"])
+            # 按价格排序
+            flights = sorted(flights, key=lambda x: x["price"])
             
             result = {
-                "outbound_flights": outbound_flights,
+                "flights": flights,
                 "search_parameters": {
                     "origin": origin,
                     "destination": destination,
@@ -348,43 +368,24 @@ class SkyscannerFlightSearchTool:
             return json.dumps(result, ensure_ascii=False)
             
         except Exception as e:
-            print(f"Error formatting response: {str(e)}")
-            return f"Error formatting Skyscanner response: {str(e)}"
+            return f"Error formatting flight results: {str(e)}"
 
-# Natural language date parsing
+# 自然语言日期解析
 def parse_natural_date(date_str, current_date=None):
-    """Parse natural language date expressions into YYYY-MM-DD format"""
+    """将自然语言日期表达式解析为YYYY-MM-DD格式"""
     if current_date is None:
         current_date = datetime.datetime.now()
     
-    # If date_str is None, return None to avoid errors
-    if date_str is None:
+    if date_str is None or not isinstance(date_str, str):
         return None
     
-    # Convert to lowercase for easier matching
-    if isinstance(date_str, str):
-        date_str = date_str.lower()
-    else:
-        return None
+    date_str = date_str.lower()
     
-    # Handle explicit date format first
-    if isinstance(date_str, str) and re.match(r'\d{4}-\d{2}-\d{2}', date_str):
+    # 处理显式日期格式
+    if re.match(r'\d{4}-\d{2}-\d{2}', date_str):
         return date_str
     
-    # Special handling for "next Friday"
-    if "next friday" in date_str:
-        # Calculate days until next Friday (weekday 4)
-        current_weekday = current_date.weekday()  # 0 is Monday, 4 is Friday
-        days_until_friday = (4 - current_weekday) % 7
-        
-        # If today is Friday or if "next" is specified, add 7 days
-        if days_until_friday == 0 or "next" in date_str:
-            days_until_friday += 7
-            
-        next_friday = current_date + datetime.timedelta(days=days_until_friday)
-        return next_friday.strftime("%Y-%m-%d")
-    
-    # Handle common date formats
+    # 特殊日期关键词
     if "today" in date_str:
         return current_date.strftime("%Y-%m-%d")
     elif "tomorrow" in date_str:
@@ -392,25 +393,23 @@ def parse_natural_date(date_str, current_date=None):
     elif "next week" in date_str:
         return (current_date + datetime.timedelta(days=7)).strftime("%Y-%m-%d")
     
-    # Handle days of the week (e.g., "next Monday")
+    # 处理星期几
     days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
     for i, day in enumerate(days):
         if day in date_str:
-            # Calculate days until the next occurrence of this day
             target_weekday = i
             current_weekday = current_date.weekday()
             days_ahead = (target_weekday - current_weekday) % 7
             
-            # If it's the same day of the week or "next" is specified, add 7 days
             if (days_ahead == 0 or "next" in date_str):
                 days_ahead += 7
                 
             target_date = current_date + datetime.timedelta(days=days_ahead)
             return target_date.strftime("%Y-%m-%d")
     
-    # Handle specific date formats like "April 12, 2025" or "12 April 2025"
+    # 处理带月份名称的特定日期格式
     try:
-        # Try to parse with various formats
+        # 尝试不同日期格式
         for fmt in ["%B %d, %Y", "%d %B %Y", "%B %d %Y", "%d %B, %Y"]:
             try:
                 parsed_date = datetime.datetime.strptime(date_str, fmt)
@@ -418,166 +417,123 @@ def parse_natural_date(date_str, current_date=None):
             except ValueError:
                 continue
                 
-        # Handle formats like "April 12" or "12 April" (assume current year)
+        # 处理"April 12"这样的格式（假设当前年份）
         months = ["january", "february", "march", "april", "may", "june", 
                   "july", "august", "september", "october", "november", "december"]
         
         for i, month in enumerate(months, 1):
             if month in date_str:
-                # Find the day number
                 day_match = re.search(r'\d+', date_str)
                 if day_match:
                     day = int(day_match.group())
-                    # Assume current year
                     year = current_date.year
                     result_date = f"{year}-{i:02d}-{day:02d}"
                     
-                    # Check if the date is in the past, if so, use next year
+                    # 如果日期在过去，使用下一年
                     parsed_date = datetime.datetime.strptime(result_date, "%Y-%m-%d").date()
                     if parsed_date < current_date.date():
                         result_date = f"{year+1}-{i:02d}-{day:02d}"
                     
                     return result_date
-    except Exception as e:
-        print(f"Error parsing specific date format: {e}")
+    except Exception:
+        pass
     
-    # Return None if all parsing attempts fail
     return None
 
-# Extract flight parameters from natural language query
+# 航班参数提取
 def extract_flight_parameters(query):
-    """Extract flight search parameters from natural language query"""
+    """从自然语言查询中提取航班搜索参数"""
     if query is None:
-        return {}  # Return empty dict if query is None
+        return {}
         
     current_date = datetime.datetime.now()
     
     try:
-        # Use LLM to extract parameters from natural language
-        prompt = f"""You are a flight search assistant. Extract the following information from this query:
-        - Origin (airport code if possible)
-        - Destination (airport code if possible) 
-        - Departure date (keep as natural language, do NOT convert to a specific date)
-        - Return date if round trip (keep as natural language, do NOT convert to a specific date)
-        - Number of passengers
-        - Cabin class (Economy, Premium Economy, Business, First)
+        # 提取参数的系统提示
+        system_prompt = """You are a flight parameter extraction system. Your ONLY task is to extract structured flight search parameters from user queries.
         
-        TODAY's DATE IS {current_date.strftime('%Y-%m-%d')}.
+        DO NOT make up or invent information not explicitly stated.
+        DO NOT include commentary or explanations.
         
-        Query: {query}
+        Output ONLY a valid JSON object with these fields if mentioned:
+        - origin: Airport code or city name
+        - destination: Airport code or city name
+        - date: The raw date mention (do not convert to a specific format)
+        - adults: Number of adult passengers (default to 1 if not specified)
+        - cabin_class: One of "Economy", "Premium Economy", or "Business"
+        - children: Number of children aged 2-12 (default to 0 if not specified)
+        - infants: Number of infants under 2 (default to 0 if not specified)
         
-        Output as JSON:"""
+        If a field is not mentioned in the query, DO NOT include it in the output.
+        """
         
-        response = llm(prompt)
+        prompt = f"Extract flight parameters from this query. Today's date is {current_date.strftime('%Y-%m-%d')}.\n\nQuery: {query}"
         
-        # Try to parse JSON response
-        try:
-            # Look for JSON object in response
-            json_start = response.find('{')
-            json_end = response.rfind('}') + 1
-            if json_start >= 0 and json_end > json_start:
-                json_str = response[json_start:json_end]
-                params = json.loads(json_str)
-            else:
-                # Fall back to simpler parsing
-                params = {}
-                for line in response.split('\n'):
-                    if ':' in line:
-                        key, value = line.split(':', 1)
-                        params[key.strip().lower()] = value.strip()
-        except Exception as json_error:
-            print(f"JSON parsing error: {json_error}")
-            # If JSON parsing fails, use regex to extract key parameters
+        response = llm(prompt, system_prompt=system_prompt, temperature=0.1)
+        
+        # 从响应中提取JSON
+        json_match = re.search(r'({.*})', response, re.DOTALL)
+        if json_match:
+            params = json.loads(json_match.group(1))
+        else:
+            # 使用正则表达式提取
             params = {}
             
-            # Airport codes are usually 3 uppercase letters
-            origin_match = re.search(r'\b([A-Z]{3})\b.*to', query, re.IGNORECASE)
-            if origin_match:
-                params['origin'] = origin_match.group(1).upper()
-            else:
-                # Try to find common city names as origin
-                cities = ["New York", "Los Angeles", "Chicago", "San Francisco", "Miami", "Seattle"]
-                for city in cities:
-                    if city.lower() in query.lower() and "to" in query.lower().split(city.lower())[1]:
-                        params['origin'] = city
-                        break
+            # 提取出发地和目的地
+            if 'from' in query.lower() and 'to' in query.lower():
+                parts = query.lower().split('from')[1].split('to')
+                if len(parts) >= 2:
+                    origin = parts[0].strip()
+                    destination = parts[1].split()[0].strip()
+                    params['origin'] = origin
+                    params['destination'] = destination
             
-            dest_match = re.search(r'to\s+\b([A-Z]{3})\b', query, re.IGNORECASE)
-            if dest_match:
-                params['destination'] = dest_match.group(1).upper()
-            else:
-                # Try to find common city names as destination
-                cities = ["New York", "Los Angeles", "Chicago", "San Francisco", "Miami", "Seattle"]
-                for city in cities:
-                    if city.lower() in query.lower() and "to" in query.lower().split(city.lower())[0]:
-                        params['destination'] = city
-                        break
-            
-            # Check cabin class
+            # 提取舱位等级
             cabin_classes = ['economy', 'premium economy', 'business', 'first']
             for cabin in cabin_classes:
                 if cabin.lower() in query.lower():
                     params['cabin_class'] = cabin.title()
                     break
             
-            # Check number of adults
+            # 提取成人数量
             adults_match = re.search(r'(\d+)\s+adult', query, re.IGNORECASE)
             if adults_match:
                 params['adults'] = int(adults_match.group(1))
             
-            # Check for date keywords
+            # 检查日期关键词
             date_keywords = ["today", "tomorrow", "next week", "monday", "tuesday", "wednesday", 
-                             "thursday", "friday", "saturday", "sunday"]
-            
-            # Store raw date mentions for later processing
+                           "thursday", "friday", "saturday", "sunday"]
             for keyword in date_keywords:
                 if keyword.lower() in query.lower():
-                    params['date'] = query  # Will be parsed with parse_natural_date later
+                    params['date'] = keyword
                     break
         
-        # Clean and validate parameters
+        # 清理和验证参数
         result = {}
         
-        # Handle origin/destination
-        if 'origin' in params and params['origin'] is not None:
+        # 处理出发地/目的地
+        if 'origin' in params and params['origin']:
             result['origin'] = params['origin'].upper() if len(params['origin']) == 3 else params['origin']
-        if 'destination' in params and params['destination'] is not None:
+        if 'destination' in params and params['destination']:
             result['destination'] = params['destination'].upper() if len(params['destination']) == 3 else params['destination']
         
-        # Special handling for "next Friday" or similar date expressions
-        if 'next friday' in query.lower():
-            date_text = "next friday"
-        else:
-            # Get raw date text for parsing
-            date_text = params.get('date') or params.get('departure_date')
-            
-            # Special handling for specific date format like "April 12, 2025"
-            date_match = re.search(r'([A-Za-z]+)\s+(\d{1,2})(?:\s*,\s*|\s+)(\d{4})', query)
-            if date_match:
-                month, day, year = date_match.groups()
-                date_text = f"{month} {day}, {year}"
-        
-        # Parse departure date
+        # 解析日期
+        date_text = params.get('date')
         if date_text:
             parsed_date = parse_natural_date(date_text, current_date)
             if parsed_date:
                 result['date'] = parsed_date
         
-        # Parse return date if any
-        return_text = params.get('return_date')
-        if return_text:
-            parsed_return = parse_natural_date(return_text, current_date)
-            if parsed_return:
-                result['return_date'] = parsed_return
-        
-        # Handle passenger count and cabin class
-        if 'adults' in params and params['adults'] is not None:
-            try:
-                result['adults'] = int(params['adults'])
-            except:
-                result['adults'] = 1
-                
-        if 'cabin_class' in params and params['cabin_class'] is not None:
+        # 处理乘客数量
+        for field in ['adults', 'children', 'infants']:
+            if field in params and params[field] is not None:
+                try:
+                    result[field] = int(params[field])
+                except:
+                    result[field] = 1 if field == 'adults' else 0
+                    
+        # 处理舱位等级
+        if 'cabin_class' in params and params['cabin_class']:
             valid_classes = ['Economy', 'Premium Economy', 'Business', 'First']
             cabin = params['cabin_class'].strip().title()
             if cabin in valid_classes:
@@ -585,7 +541,7 @@ def extract_flight_parameters(query):
             elif 'business' in cabin.lower():
                 result['cabin_class'] = 'Business'
             elif 'first' in cabin.lower():
-                result['cabin_class'] = 'First'
+                result['cabin_class'] = 'Business'  # API不支持First，映射到Business
             elif 'premium' in cabin.lower():
                 result['cabin_class'] = 'Premium Economy'
             else:
@@ -596,7 +552,7 @@ def extract_flight_parameters(query):
         print(f"Error extracting flight parameters: {str(e)}")
         return {}
 
-# Create tools
+# 创建工具
 flight_search = SkyscannerFlightSearchTool()
 tools = [tavily, flight_search]
 tool_names = '|'.join([tool.name for tool in tools])
@@ -613,7 +569,7 @@ for t in tools:
     tool_descs.append(f"{t.name}: {t.description}, args: {args_desc}")
 tool_descs = '\n'.join(tool_descs)
 
-# Prompt template
+# 提示模板
 prompt_tpl = '''Today is {today}. Please help the user with their flight search request. You have access to the following tools:
 
 {tool_descs}
@@ -627,15 +583,15 @@ Use the following format:
 
 Question: the input question you must answer
 Thought: Think step by step to understand what information the user is looking for. For flight searches, carefully identify:
-  1. Origin and destination airports/cities
+  1. Origin and destination airports/cities 
   2. Travel dates (departure and return if applicable)
-  3. Number of passengers 
-  4. Cabin class preferences
-  5. Any other specific requirements (direct flights, price range, etc.)
+  3. Number of passengers (adults, children, infants)
+  4. Cabin class preferences (Economy, Premium Economy, Business)
+  5. Any other specific requirements (non-stop flights, price range, etc.)
 Action: the action to take, should be one of [{tool_names}]
-Action Input: the input to the action - use valid JSON format with quotes around string values, e.g., {{"key": "value", "number": 42}}. Do NOT use markdown code blocks (```).
+Action Input: the input to the action - use valid JSON format with quotes around string values, e.g., {{"key": "value", "number": 42}}. Do NOT use markdown code blocks.
 Observation: the result of the action
-... (this Thought/Action/Action Input/Observation can be repeated zero or more times)
+... (this Thought/Action/Action Input/Observation can be repeated if needed)
 Thought: I now know the final answer
 Final Answer: Present the flight information in a clear, organized manner. For each flight option, include:
 - Airline and flight number
@@ -643,7 +599,7 @@ Final Answer: Present the flight information in a clear, organized manner. For e
 - Duration
 - Cabin class
 - Price
-- Number of available seats (if known)
+- Number of stops
 
 For the user, explain if any information was missing from their query and what assumptions you made.
 
@@ -653,21 +609,21 @@ Question: {query}
 {agent_scratchpad}
 '''
 
-# Agent execution logic
+# 代理执行逻辑
 def agent_execute(query, chat_history=[]):
     global tools, tool_names, tool_descs, prompt_tpl, llm
 
-    # Preprocess query to extract flight parameters (if it's a flight query)
-    flight_keywords = ['flight', 'fly', 'plane', 'airport', 'travel']
+    # 预处理航班查询
+    flight_keywords = ['flight', 'fly', 'plane', 'airport', 'travel', 'trip']
     is_flight_query = any(keyword in query.lower() for keyword in flight_keywords)
     
     if is_flight_query:
-        # Extract flight parameters to make it easier for the agent to process
+        # 提取航班参数
         flight_params = extract_flight_parameters(query)
         if flight_params:
-            print(f"Extracted flight parameters: {flight_params}")
-            # Enhance query with structured data
-            query = f"{query}\n\nExtracted flight parameters: {json.dumps(flight_params, indent=2)}"
+            # 用结构化参数增强查询
+            query_addition = f"\n\nExtracted parameters: {json.dumps(flight_params, indent=2)}"
+            query = f"{query}{query_addition}"
     
     agent_scratchpad = ''
     while True:
@@ -682,11 +638,9 @@ def agent_execute(query, chat_history=[]):
             agent_scratchpad=agent_scratchpad
         )
 
-        print('\033[32m---Waiting for LLM response...\033[0m', flush=True)
         response = llm(prompt, user_stop_words=['Observation:'])
-        print('\033[34m---LLM Response---\n%s\n---\033[34m' % response, flush=True)
 
-        # Parse response content
+        # 解析响应内容
         thought_i = response.rfind('Thought:')
         final_answer_i = response.rfind('\nFinal Answer:')
         action_i = response.rfind('\nAction:')
@@ -699,7 +653,11 @@ def agent_execute(query, chat_history=[]):
             return True, final_answer, chat_history
 
         if not (thought_i < action_i < action_input_i):
-            return False, 'Abnormal LLM response format', chat_history
+            # 格式不正确，生成回退响应
+            fallback_response = "I'm having trouble processing your flight search request. Could you please provide more specific details like origin, destination, travel dates, and the number of passengers?"
+            chat_history.append((query, fallback_response))
+            return True, fallback_response, chat_history
+            
         if observation_i == -1:
             observation_i = len(response)
             response = response + '\nObservation: '
@@ -708,32 +666,42 @@ def agent_execute(query, chat_history=[]):
         action = response[action_i + len('\nAction:'):action_input_i].strip()
         action_input = response[action_input_i + len('\nAction Input:'):observation_i].strip()
 
-        # Find tool
+        # 查找工具
         the_tool = next((t for t in tools if t.name == action), None)
         if the_tool is None:
-            observation = 'The tool does not exist'
+            observation = 'The tool does not exist. Please use one of the available tools.'
             agent_scratchpad += response + observation + '\n'
             continue
 
         try:
-            # Pass action_input as is, let the tool handle parsing
+            # 使用工具
             tool_ret = the_tool.invoke(input=action_input)
         except Exception as e:
-            observation = f'The tool encountered an error: {e}'
+            observation = f'Tool execution error: {e}'
         else:
             observation = str(tool_ret)
 
         agent_scratchpad += response + observation + '\n'
 
-# Agent retry function
-def agent_execute_with_retry(query, chat_history=[], retry_times=3):
+# 带错误处理的代理重试
+def agent_execute_with_retry(query, chat_history=[], retry_times=2):
     for i in range(retry_times):
-        success, result, chat_history = agent_execute(query, chat_history=chat_history)
-        if success:
-            return success, result, chat_history
-    return success, result, chat_history
+        try:
+            success, result, chat_history = agent_execute(query, chat_history=chat_history)
+            if success:
+                return success, result, chat_history
+        except Exception as e:
+            if i == retry_times - 1:
+                error_msg = f"I apologize, but I'm having trouble processing your request due to a technical issue. Could you please try rephrasing your question or providing more specific flight details?"
+                chat_history.append((query, error_msg))
+                return False, error_msg, chat_history
+    
+    # 所有重试都失败
+    fallback_msg = "I couldn't find the flight information you requested. Could you please provide more details about your trip, including specific airports or cities, travel dates, and passenger information?"
+    chat_history.append((query, fallback_msg))
+    return False, fallback_msg, chat_history
 
-# Main function
+# 主函数
 def main():
     current_date = datetime.datetime.now()
     print(f"🛫 Flight Search AI Agent 🛬")
@@ -751,7 +719,7 @@ def main():
             break
         else:
             success, result, my_history = agent_execute_with_retry(query, chat_history=my_history)
-            my_history = my_history[-10:]  # Only keep last 10 interactions
+            my_history = my_history[-5:]  # 仅保留最后5个交互
             print(f"\n{result}")
 
 if __name__ == "__main__":
